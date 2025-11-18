@@ -97,14 +97,15 @@ def build_join(claims_table: str, ids_table: str, out_table: str):
     生成 out_table：
 
     out_table = claims_table ⨝ ids_table （按 claim_id 连接）
-        + 额外两列（如果能找到的话）：
-          - sVinNumber  （来自 contract_vehicle）
-          - invoice_hash（来自 p8_invoice_claims）
+        + 额外几列（如果能找到的话）：
+          - sVinNumber   （来自 contract_vehicle）
+          - invoice_hash （来自 p8_invoice_claims）
+          - seller_name  （来自 entity_sellers）
 
     English:
     Create `out_table` as a join of base claims and the IDs table,
-    and additionally left-join contract_vehicle and p8_invoice_claims
-    to bring in `sVinNumber` and `invoice_hash`.
+    and additionally left-join contract_vehicle, p8_invoice_claims,
+    and entity_sellers to bring in sVinNumber, invoice_hash, seller_name.
     """
     mssql_conn_str = cfg.mssql_conn_str
     if not mssql_conn_str:
@@ -183,10 +184,42 @@ def build_join(claims_table: str, ids_table: str, out_table: str):
         else:
             print("[info] table p8_invoice_claims not found; skip invoice_hash.")
 
-        # ---------- 4) 组装 SELECT INTO 语句（MSSQL 语法） ----------
+        # ---------- 4) 找 entity_sellers 上的 seller_name ----------
+        es_table = "entity_sellers"
+        es_join = ""
+        if table_exists(conn, es_table):
+            # ids_table(x) 里 seller 主键列
+            ids_seller_col = find_col(conn, ids_table, ["seller_id", "isellerid", "iSellerId"])
+            # entity_sellers 主键 & 名称列
+            es_id_col = find_col(conn, es_table, ["iid", "iId", "seller_id", "id"])
+            es_name_col = find_col(
+                conn,
+                es_table,
+                ["seller_name", "name", "legal_name", "display_name"],
+            )
+
+            if ids_seller_col and es_id_col and es_name_col:
+                es_join = (
+                    f"\n    LEFT JOIN {es_table} AS es "
+                    f"ON x.{ids_seller_col} = es.{es_id_col}"
+                )
+                select_extra.append(f"es.{es_name_col} AS seller_name")
+                print(
+                    f"[info] will attach seller_name from {es_table} "
+                    f"(x.{ids_seller_col} -> es.{es_name_col})"
+                )
+            else:
+                print(
+                    f"[warn] entity_sellers exists but cannot find id/name columns; "
+                    f"skip seller_name."
+                )
+        else:
+            print("[info] table entity_sellers not found; skip seller_name.")
+
+        # ---------- 5) 组装 SELECT INTO 语句（MSSQL 语法） ----------
         extra_sql = ""
         if select_extra:
-            extra_sql = ",\n        " + ",\n        ".join(select_extra)
+            extra_sql = ",\n    " + ",\n    ".join(select_extra)
 
         sql = f"""
 IF OBJECT_ID('{out_table}', 'U') IS NOT NULL
@@ -198,26 +231,34 @@ SELECT
 INTO {out_table}
 FROM {claims_table} AS c
 JOIN {ids_table}   AS x
-    ON c.{ck} = x.{ik}{cv_join}{p8_join};
+    ON c.{ck} = x.{ik}{cv_join}{p8_join}{es_join};
 """
         conn.exec_driver_sql(sql)
 
-        # ---------- 5) 建索引 ----------
+        # ---------- 6) 建索引（如果不存在） ----------
         idx_name = f"idx_{out_table}_claim_id"
-        conn.exec_driver_sql(
-            f"CREATE INDEX {idx_name} ON {out_table}({ck});"
-        )
+        idx_sql = f"""
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = '{idx_name}'
+      AND object_id = OBJECT_ID('{out_table}')
+)
+BEGIN
+    CREATE INDEX {idx_name} ON {out_table}({ck});
+END;
+"""
+        conn.exec_driver_sql(idx_sql)
 
-        # ---------- 6) 统计行数 ----------
+        # ---------- 7) 统计行数 ----------
         n = conn.execute(
             sa.text(f"SELECT COUNT(*) FROM {out_table}")
         ).scalar()
         print(
             f"[OK] {out_table} rows={n}  "
-            f"(extra cols attempted: {', '.join(['sVinNumber', 'invoice_hash'])})"
+            f"(extra cols attempted: {', '.join(['sVinNumber', 'invoice_hash', 'seller_name'])})"
         )
 
-        # ---------- 7) 导出 CSV ----------
+        # ---------- 8) 导出 CSV ----------
         csv_path = OUT_DIR / f"{out_table}.csv"
         df = pd.read_sql(f"SELECT * FROM {out_table}", conn)
         df.to_csv(csv_path, index=False)
