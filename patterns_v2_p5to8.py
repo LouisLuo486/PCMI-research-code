@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Patterns v2 (start from P5; legacy P1–P4 not used):
+Patterns v2 (MSSQL version; start from P5, legacy P1–P4 not used):
 - P5: VIN Burst (short-window multi-claims per VIN)
 - P6: Cross-shop Repairs (short-window multi-servicers per VIN)
 - P7: Coordinated Clusters (servicer×seller high-density pairs)
 - P8: Invoice Cloning (exact part-list signature reuse)
 
-Outputs: CSVs under out/, summary_counts_v2.csv, and optional write-back to SQLite tables.
+Data source: MSSQL Server (tables: claims, claim_details, contracts, contract_vehicle,
+            entity_servicers, entity_sellers, coverage_plans_seller_inclusion, ...)
+
+Outputs:
+  - CSVs under OUT_DIR (from config.py / .env)
+  - MSSQL tables for some results (e.g., p8_invoice_hashes, p8_invoice_claims,
+    p3p4p5p6p7p8_claims)
 """
 
-import os, sqlite3, hashlib
+import os
+import hashlib
 from pathlib import Path
+
 import pandas as pd
 import numpy as np
+import sqlalchemy as sa
+
+from config import Config
+
+cfg = Config()
 
 # ================== Tunables ==================
 # P5
@@ -34,25 +47,23 @@ PRICE_COL_CANDS      = ['unit_price','price','unitprice','nunitprice','nprice','
 QTY_COL_CANDS        = ['qty','quantity','nqty','nquantity','count','num']
 PART_COL_CANDS       = ['part_code','partnumber','part_no','spartno','spartcode','part','part_code_id','partid','sparepart','partdesc','part_description']
 
-# ================== Paths ==================
+# ================== Paths & MSSQL Engine ==================
 BASE_DIR = Path(__file__).resolve().parents[1]
-DB_PATH  = BASE_DIR / 'out' / 'data.sqlite'
-OUT_DIR  = DB_PATH.parent
+OUT_DIR  = Path(cfg.out_dir)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-print(f"> DB: {DB_PATH}  exists={DB_PATH.exists()}")
+MSSQL_CONN_STR = cfg.mssql_conn_str
+if not MSSQL_CONN_STR:
+    raise RuntimeError("MSSQL_CONN_STR not set. 请在 .env 里配置 MSSQL_CONN_STR")
+
+engine = sa.create_engine(MSSQL_CONN_STR, fast_executemany=True)
+print(f"> MSSQL engine created for: {MSSQL_CONN_STR}")
 
 # ================== Helpers ==================
-def table_exists(conn, name: str) -> bool:
-    q = "SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower(?)"
-    try:
-        return pd.read_sql(q, conn, params=[name]).shape[0] > 0
-    except Exception:
-        return False
-
 def pick_col(df: pd.DataFrame, candidates, required=True, tag="", exclude=None):
     if df is None or df.empty:
-        if required: raise KeyError(f"[{tag}] empty df")
+        if required:
+            raise KeyError(f"[{tag}] empty df")
         return None
     exclude = [x.lower() for x in (exclude or [])]
     cols_lower = {c.lower(): c for c in df.columns}
@@ -60,7 +71,8 @@ def pick_col(df: pd.DataFrame, candidates, required=True, tag="", exclude=None):
         lc = c.lower()
         if lc in cols_lower:
             orig = cols_lower[lc]
-            if any(e in orig.lower() for e in exclude): continue
+            if any(e in orig.lower() for e in exclude):
+                continue
             print(f"  - [{tag}] use column: {orig}")
             return orig
     for c in candidates:
@@ -89,36 +101,57 @@ def save_csv(df: pd.DataFrame, name: str) -> Path:
 def md5(s: str) -> str:
     return hashlib.md5(s.encode('utf-8','ignore')).hexdigest()
 
-# ================== Load tables ==================
-with sqlite3.connect(DB_PATH) as conn:
-    tabs = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)['name'].str.lower().tolist()
-    print("> tables:", tabs)
+# ================== Load tables from MSSQL ==================
+with engine.begin() as conn:
+    # 打印现有表名（方便 sanity check）
+    try:
+        tabs = pd.read_sql(
+            "SELECT TABLE_NAME AS name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'",
+            conn
+        )['name'].str.lower().tolist()
+    except Exception as e:
+        print("(warn) cannot list tables from MSSQL:", e)
+        tabs = []
+    print("> MSSQL tables:", tabs)
 
-    def read_if(tn):
-        return pd.read_sql(f"SELECT * FROM {tn}", conn) if (tn and table_exists(conn, tn)) else pd.DataFrame()
+    def read_if(tn: str) -> pd.DataFrame:
+        """如果表存在就读，不存在返回空 DataFrame。"""
+        if not tn:
+            return pd.DataFrame()
+        try:
+            return pd.read_sql(f"SELECT * FROM {tn}", conn)
+        except Exception as e:
+            print(f"(warn) cannot read table {tn}: {e}")
+            return pd.DataFrame()
 
-    t_claims   = 'claims' if 'claims' in tabs else next((t for t in tabs if 'claims' in t or t=='claim'), None)
-    t_cdet     = 'claim_details' if 'claim_details' in tabs else next((t for t in tabs if 'claim' in t and 'detail' in t), None)
-    t_contracts= 'contracts' if 'contracts' in tabs else next((t for t in tabs if 'contract' in t and 'vehicle' not in t), None)
-    t_cveh     = 'contract_vehicle' if 'contract_vehicle' in tabs else next((t for t in tabs if 'vehicle' in t), None)
-    t_serv     = 'entity_servicers' if 'entity_servicers' in tabs else next((t for t in tabs if 'servicer' in t), None)
-    t_seller   = 'entity_sellers' if 'entity_sellers' in tabs else next((t for t in tabs if 'seller' in t), None)
-    t_cpsi     = 'coverage_plans_seller_inclusion' if 'coverage_plans_seller_inclusion' in tabs else next((t for t in tabs if 'coverage' in t and 'seller' in t), None)
+    # 假设 MSSQL 中的表名如下（如有 schema，可写成 'dbo.claims' 等）
+    t_claims    = 'claims'
+    t_cdet      = 'claim_details'
+    t_contracts = 'contracts'
+    t_cveh      = 'contract_vehicle'
+    t_serv      = 'entity_servicers'
+    t_seller    = 'entity_sellers'
+    t_cpsi      = 'coverage_plans_seller_inclusion'
 
-    claims     = read_if(t_claims)
-    cdet       = read_if(t_cdet)
-    contracts  = read_if(t_contracts)
-    cveh       = read_if(t_cveh)
-    serv       = read_if(t_serv)
-    seller     = read_if(t_seller)
-    cpsi       = read_if(t_cpsi)
+    claims    = read_if(t_claims)
+    cdet      = read_if(t_cdet)
+    contracts = read_if(t_contracts)
+    cveh      = read_if(t_cveh)
+    serv      = read_if(t_serv)
+    seller    = read_if(t_seller)
+    cpsi      = read_if(t_cpsi)
 
 if claims.empty:
-    raise RuntimeError("claims table not found or empty")
+    raise RuntimeError("claims table not found or empty in MSSQL")
 
 # ===== pick columns =====
 col_claim_id   = pick_col(claims, ['iid','iId','claim_id','id'], tag='claims.id')
-col_claim_date = pick_col(claims, ['service_date','servicedate','dservicedate','claim_date','dclaimdate','created_at','dentrydate'], required=False, tag='claims.date')
+col_claim_date = pick_col(
+    claims,
+    ['service_date','servicedate','dservicedate','claim_date','dclaimdate','created_at','dentrydate'],
+    required=False,
+    tag='claims.date'
+)
 col_contract_id= pick_col(claims, ['icontractid','iContractId','contract_id'], required=False, tag='claims.contract')
 col_servicer   = pick_col(claims, ['iservicerid','iServicerId','servicer_id'], required=False, tag='claims.servicer')
 
@@ -131,54 +164,94 @@ if not cveh.empty:
     col_v_contract = pick_col(cveh, ['icontractid','contract_id','iContractId'], tag='cveh.contract')
     col_vin        = pick_col(cveh, ['vin','svin','vehicle_vin'], tag='cveh.vin')
     vin_map = cveh[[col_v_contract, col_vin]].dropna().copy()
-    vin_map[col_v_contract] = as_str(vin_map[col_v_contract]); vin_map[col_vin] = as_str(vin_map[col_vin])
+    vin_map[col_v_contract] = as_str(vin_map[col_v_contract])
+    vin_map[col_vin]        = as_str(vin_map[col_vin])
 elif not contracts.empty:
     col_v_contract = pick_col(contracts, ['iid','iId','contract_id','id'], tag='contracts.id')
     col_vin        = pick_col(contracts, ['vin','svin','vehicle_vin'], required=False, tag='contracts.vin')
     if col_vin:
         vin_map = contracts[[col_v_contract, col_vin]].dropna().copy()
-        vin_map[col_v_contract] = as_str(vin_map[col_v_contract]); vin_map[col_vin] = as_str(vin_map[col_vin])
+        vin_map[col_v_contract] = as_str(vin_map[col_v_contract])
+        vin_map[col_vin]        = as_str(vin_map[col_vin])
 
 # policyholder（可选）
 ph_map = pd.DataFrame()
+col_c_id = None
 if not contracts.empty:
     col_c_id = pick_col(contracts, ['iid','iId','contract_id','id'], tag='contracts.id(reuse)')
-    col_ph   = pick_col(contracts, ['policyholder_id','icustomerid','customer_id','ipolicyholderid'], required=False, tag='contracts.ph')
+    col_ph   = pick_col(
+        contracts,
+        ['policyholder_id','icustomerid','customer_id','ipolicyholderid'],
+        required=False,
+        tag='contracts.ph'
+    )
     if col_ph:
         ph_map = contracts[[col_c_id, col_ph]].dropna().copy()
-        ph_map[col_c_id] = as_str(ph_map[col_c_id]); ph_map[col_ph] = as_str(ph_map[col_ph])
+        ph_map[col_c_id] = as_str(ph_map[col_c_id])
+        ph_map[col_ph]   = as_str(ph_map[col_ph])
 
 # coverage→seller（供 P7 用）
 cc = pd.DataFrame()
-if (not cpsi.empty) and (col_contract_id is not None):
-    col_cov_on_contracts = pick_col(contracts, ['icoverageid','coverage_id','coverage_plan_id','iCoverageId','iCoveragePlanId'], required=False, tag='contracts.coverage')
-    col_cpsi_cov = pick_col(cpsi, ['coverage_id','icoverageid','coverage_plan_id','icoverageplanid','iCoverageId'], tag='cpsi.cov')
-    col_cpsi_sel = pick_col(cpsi, ['seller_id','isellerid','iSellerId'], tag='cpsi.seller')
+if (not cpsi.empty) and (col_contract_id is not None) and (not contracts.empty) and (col_c_id is not None):
+    col_cov_on_contracts = pick_col(
+        contracts,
+        ['icoverageid','coverage_id','coverage_plan_id','iCoverageId','iCoveragePlanId'],
+        required=False,
+        tag='contracts.coverage'
+    )
+    col_cpsi_cov = pick_col(
+        cpsi,
+        ['coverage_id','icoverageid','coverage_plan_id','icoverageplanid','iCoverageId'],
+        tag='cpsi.cov'
+    )
+    col_cpsi_sel = pick_col(
+        cpsi,
+        ['seller_id','isellerid','iSellerId'],
+        tag='cpsi.seller'
+    )
     if col_cov_on_contracts:
         _c = claims[[col_claim_id, col_contract_id]].dropna().copy()
-        _c[col_claim_id] = as_str(_c[col_claim_id]); _c[col_contract_id] = as_str(_c[col_contract_id])
+        _c[col_claim_id]   = as_str(_c[col_claim_id])
+        _c[col_contract_id]= as_str(_c[col_contract_id])
         _k = contracts[[col_c_id, col_cov_on_contracts]].dropna().copy()
-        _k[col_c_id] = as_str(_k[col_c_id]); _k[col_cov_on_contracts] = as_str(_k[col_cov_on_contracts])
+        _k[col_c_id]           = as_str(_k[col_c_id])
+        _k[col_cov_on_contracts]= as_str(_k[col_cov_on_contracts])
         cc = _c.merge(_k, left_on=col_contract_id, right_on=col_c_id, how='left')
         if not cc.empty:
+            cps = cpsi[[col_cpsi_cov, col_cpsi_sel]].copy()
+            cps[col_cpsi_cov] = as_str(cps[col_cpsi_cov])
+            cps[col_cpsi_sel] = as_str(cps[col_cpsi_sel])
             cc = cc.merge(
-                cpsi[[col_cpsi_cov, col_cpsi_sel]].assign(
-                    **{col_cpsi_cov: as_str(cpsi[col_cpsi_cov]), col_cpsi_sel: as_str(cpsi[col_cpsi_sel])}
-                ),
-                left_on=col_cov_on_contracts, right_on=col_cpsi_cov, how='left'
+                cps,
+                left_on=col_cov_on_contracts,
+                right_on=col_cpsi_cov,
+                how='left'
             )
 
 # attach VIN/policyholder/servicer/date to claims
 claims_min = claims[[col_claim_id]].copy()
 claims_min[col_claim_id] = as_str(claims_min[col_claim_id])
-if col_claim_date: claims_min[col_claim_date] = claims[col_claim_date]
-if col_contract_id: claims_min[col_contract_id] = as_str(claims[col_contract_id])
-if col_servicer:    claims_min[col_servicer]    = as_str(claims[col_servicer])
+if col_claim_date:
+    claims_min[col_claim_date] = claims[col_claim_date]
+if col_contract_id:
+    claims_min[col_contract_id] = as_str(claims[col_contract_id])
+if col_servicer:
+    claims_min[col_servicer] = as_str(claims[col_servicer])
 
 if not vin_map.empty and col_contract_id:
-    claims_min = claims_min.merge(vin_map, left_on=col_contract_id, right_on=col_v_contract, how='left').rename(columns={col_vin:'vin'})
+    claims_min = claims_min.merge(
+        vin_map,
+        left_on=col_contract_id,
+        right_on=col_v_contract,
+        how='left'
+    ).rename(columns={col_vin: 'vin'})
 if not ph_map.empty and col_contract_id:
-    claims_min = claims_min.merge(ph_map, left_on=col_contract_id, right_on=col_c_id, how='left').rename(columns={ph_map.columns[1]:'policyholder_id'})
+    claims_min = claims_min.merge(
+        ph_map,
+        left_on=col_contract_id,
+        right_on=col_c_id,
+        how='left'
+    ).rename(columns={ph_map.columns[1]: 'policyholder_id'})
 
 # =========================================================
 # P5: VIN Burst
@@ -206,7 +279,10 @@ if 'vin' in claims_min.columns and col_claim_date:
                     'distinct_servicers': int(sub[col_servicer].nunique()) if col_servicer else np.nan,
                     'claim_ids': "|".join(as_str(sub[col_claim_id]).tolist())
                 })
-    p5_bursts = pd.DataFrame(rows).drop_duplicates().sort_values(['num_claims','distinct_servicers'], ascending=False)
+    p5_bursts = pd.DataFrame(rows).drop_duplicates().sort_values(
+        ['num_claims','distinct_servicers'],
+        ascending=False
+    )
 
 p5_path = save_csv(p5_bursts, 'p5_vin_bursts.csv')
 
@@ -215,7 +291,8 @@ p5_path = save_csv(p5_bursts, 'p5_vin_bursts.csv')
 p6_cross = pd.DataFrame()
 if 'vin' in claims_min.columns and col_claim_date and col_servicer:
     df = claims_min.dropna(subset=['vin', col_claim_date, col_servicer]).copy()
-    df['vin'] = as_str(df['vin']); df[col_servicer] = as_str(df[col_servicer])
+    df['vin'] = as_str(df['vin'])
+    df[col_servicer] = as_str(df[col_servicer])
     df = df.sort_values(['vin', col_claim_date])
 
     rows = []
@@ -237,15 +314,17 @@ if 'vin' in claims_min.columns and col_claim_date and col_servicer:
                     'servicer_ids': "|".join(sorted(as_str(sub[col_servicer]).unique().tolist())),
                     'claim_ids':    "|".join(as_str(sub[col_claim_id]).tolist())
                 })
-    p6_cross = pd.DataFrame(rows).drop_duplicates().sort_values(['distinct_servicers','num_claims'], ascending=False)
+    p6_cross = pd.DataFrame(rows).drop_duplicates().sort_values(
+        ['distinct_servicers','num_claims'],
+        ascending=False
+    )
 
 p6_path = save_csv(p6_cross, 'p6_cross_shop.csv')
 
 # =========================================================
 # P7: Coordinated Clusters (servicer×seller high-density pairs)
-# 这里同时算两样：
-# 1) pair 级的统计表 p7_pairs（写到 p7_cluster_pairs.csv）
-# 2) 被这些高密度 pair 覆盖到的 claim 集合 p7_pair_claims_set（后面 P3–P8 交集要用）
+# 1) pair 级统计 p7_pairs → p7_cluster_pairs.csv
+# 2) 被这些 pair 覆盖的 claim 集合 p7_pair_claims_set
 # =========================================================
 
 p7_pairs = pd.DataFrame()
@@ -253,18 +332,15 @@ p7_pair_claims_set = set()
 
 if not cc.empty and 'vin' in claims_min.columns and col_servicer:
 
-    # ---------- 1) 先构造 claim 级明细 tmp：claim_id, servicer_id, seller_id, vin, policyholder(optional) ----------
-    # 从 cc 里取 claim_id 和 seller
+    # ---------- 1) 构造 claim 明细 tmp：claim_id, servicer_id, seller_id, vin, policyholder(optional) ----------
     tmp = cc[[col_claim_id, col_cpsi_sel]].dropna().copy()
 
-    # 把 id 列转成整数类型（不用字符串 + strip，省内存）
     tmp[col_claim_id] = pd.to_numeric(tmp[col_claim_id], errors='coerce')
     tmp[col_cpsi_sel] = pd.to_numeric(tmp[col_cpsi_sel], errors='coerce')
     tmp = tmp.dropna(subset=[col_claim_id, col_cpsi_sel]).astype(
         {col_claim_id: 'Int64', col_cpsi_sel: 'Int64'}
     )
 
-    # 从 claims_min 附上 vin / servicer / policyholder
     attach_cols = [col_claim_id, 'vin', col_servicer]
     if 'policyholder_id' in claims_min.columns:
         attach_cols.append('policyholder_id')
@@ -278,26 +354,28 @@ if not cc.empty and 'vin' in claims_min.columns and col_servicer:
         {col_claim_id: 'Int64', col_servicer: 'Int64'}
     )
 
-    # inner join：只要既在 cc 里又在 claims_min 里的 claim
     tmp = tmp.merge(attach, on=col_claim_id, how='inner')
 
     # ---------- 2) pair 级聚合（得到 p7_pairs） ----------
-    grp = tmp.groupby([col_servicer, col_cpsi_sel]).agg(
-        distinct_vins=('vin', 'nunique'),
-        distinct_policyholders=(
-            ('policyholder_id', 'nunique')
-            if 'policyholder_id' in tmp.columns
-            else ('vin', 'size')
-        ),
-        claims=('vin', 'size')
-    ).reset_index().rename(
-        columns={col_servicer: 'servicer_id', col_cpsi_sel: 'seller_id'}
-    )
+    if 'policyholder_id' in tmp.columns:
+        grp = tmp.groupby([col_servicer, col_cpsi_sel]).agg(
+            distinct_vins=('vin', 'nunique'),
+            distinct_policyholders=('policyholder_id', 'nunique'),
+            claims=('vin', 'size')
+        ).reset_index()
+    else:
+        grp = tmp.groupby([col_servicer, col_cpsi_sel]).agg(
+            distinct_vins=('vin', 'nunique'),
+            distinct_policyholders=('vin', 'size'),
+            claims=('vin', 'size')
+        ).reset_index()
+
+    grp = grp.rename(columns={col_servicer: 'servicer_id', col_cpsi_sel: 'seller_id'})
 
     if 'policyholder_id' in tmp.columns:
         p7_pairs = grp[
-            (grp['distinct_vins'] >= P7_MIN_DISTINCT_VINS)
-            & (grp['distinct_policyholders'] >= P7_MIN_DISTINCT_PH)
+            (grp['distinct_vins'] >= P7_MIN_DISTINCT_VINS) &
+            (grp['distinct_policyholders'] >= P7_MIN_DISTINCT_PH)
         ].copy()
     else:
         p7_pairs = grp[grp['distinct_vins'] >= P7_MIN_DISTINCT_VINS].copy()
@@ -307,30 +385,26 @@ if not cc.empty and 'vin' in claims_min.columns and col_servicer:
 
     # ---------- 3) claim 级覆盖集合 p7_pair_claims_set ----------
     if not p7_pairs.empty:
-        # 先拿到所有 claim_id + (servicer_id, seller_id)
         claim_pairs = tmp[[col_claim_id, col_servicer, col_cpsi_sel]].copy()
         claim_pairs = claim_pairs.rename(
             columns={col_servicer: 'servicer_id', col_cpsi_sel: 'seller_id'}
         )
 
-        # 只保留落在高密度 pair 列表里的那些 (servicer, seller)
         key = ['servicer_id', 'seller_id']
         pairs_key = p7_pairs[key].drop_duplicates()
 
         hit = claim_pairs.merge(pairs_key, on=key, how='inner')
-
-        # 转回字符串，后面做集合交集统一用 str
         p7_pair_claims_set = set(hit[col_claim_id].astype(str))
 
 else:
-    # 没有 cc 或没有 vin/servicer，就输出空表避免后面读文件报错
     save_csv(pd.DataFrame(), 'p7_cluster_pairs.csv')
-
-
 
 # =========================================================
 # P8: Invoice Cloning
-p8_hash = pd.DataFrame(); p8_claims = pd.DataFrame()
+# =========================================================
+p8_hash = pd.DataFrame()
+p8_claims = pd.DataFrame()
+
 if not cdet.empty:
     col_cd_claim = pick_col(cdet, ['iclaimid','claim_id'], tag='cd.claim')
     col_part = pick_col(cdet, PART_COL_CANDS, required=False, tag='cd.part')
@@ -339,29 +413,39 @@ if not cdet.empty:
     cols = [c for c in [col_part, col_qty, col_price] if c]
 
     df = cdet[[col_cd_claim] + cols].copy()
-    for c in df.columns: df[c] = df[c].astype(str).str.strip().str.lower()
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.strip().str.lower()
 
     def norm_line(row):
         p = (row.get(col_part) or '').replace(' ', '')
         q = row.get(col_qty) or ''
-        pr= row.get(col_price) or ''
+        pr = row.get(col_price) or ''
         return f"{p}:{q}:{pr}"
 
     df['_line'] = df.apply(norm_line, axis=1)
-    lines = (df.groupby(col_cd_claim)['_line']
-               .apply(lambda s: "|".join(sorted([x for x in s if x]))).reset_index(name='invoice_signature'))
+    lines = (
+        df.groupby(col_cd_claim)['_line']
+          .apply(lambda s: "|".join(sorted([x for x in s if x])))
+          .reset_index(name='invoice_signature')
+    )
     lines['invoice_hash'] = lines['invoice_signature'].apply(md5)
 
     meta_cols = [col_claim_id]
-    if 'vin' in claims_min.columns: meta_cols.append('vin')
-    if col_servicer: meta_cols.append(col_servicer)
+    if 'vin' in claims_min.columns:
+        meta_cols.append('vin')
+    if col_servicer:
+        meta_cols.append(col_servicer)
     meta = claims_min[meta_cols].copy()
     meta[col_claim_id] = as_str(meta[col_claim_id])
 
-    p8 = lines.rename(columns={col_cd_claim: col_claim_id}).merge(meta, on=col_claim_id, how='left')
+    p8 = lines.rename(columns={col_cd_claim: col_claim_id}).merge(
+        meta,
+        on=col_claim_id,
+        how='left'
+    )
 
     hstat = p8.groupby('invoice_hash').agg(
-        num_claims   =(col_claim_id,'nunique'),
+        num_claims=(col_claim_id,'nunique'),
         distinct_vins=('vin','nunique') if 'vin' in p8.columns else (col_claim_id,'size'),
         distinct_servicers=(col_servicer,'nunique') if col_servicer in p8.columns else (col_claim_id,'size'),
         first_seen=('invoice_signature','first')
@@ -369,179 +453,56 @@ if not cdet.empty:
 
     p8_hash = hstat[hstat['num_claims'] >= P8_MIN_DUP_HASH].copy()
     flagged = p8[p8['invoice_hash'].isin(p8_hash['invoice_hash'])]
-    keep = [col_claim_id,'invoice_hash']
-    if 'vin' in flagged.columns: keep.append('vin')
-    if col_servicer in flagged.columns: keep.append(col_servicer)
+
+    keep = [col_claim_id, 'invoice_hash']
+    if 'vin' in flagged.columns:
+        keep.append('vin')
+    if col_servicer in flagged.columns:
+        keep.append(col_servicer)
     p8_claims = flagged[keep].drop_duplicates()
 
 p8h_path = save_csv(p8_hash,   'p8_invoice_hashes.csv')
 p8c_path = save_csv(p8_claims, 'p8_invoice_flagged_claims.csv')
 
-
-
-# ================== (optional) write back simple tables ==================
+# ================== write back P8 to MSSQL ==================
 try:
-    with sqlite3.connect(DB_PATH) as conn:
-        for t in ["p8_invoice_hashes","p8_invoice_claims"]:
-            conn.execute(f"DROP TABLE IF EXISTS {t}")
-        p8_hash.to_sql('p8_invoice_hashes', conn, if_exists='replace', index=False)
-        p8_claims.to_sql('p8_invoice_claims', conn, if_exists='replace', index=False)
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_p8_hash ON p8_invoice_claims(invoice_hash)")
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_p8_claim ON p8_invoice_claims({col_claim_id})")
-        print("  -> wrote tables: p8_invoice_hashes / p8_invoice_claims")
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            IF OBJECT_ID('dbo.p8_invoice_hashes', 'U') IS NOT NULL
+                DROP TABLE dbo.p8_invoice_hashes;
+        """)
+        conn.exec_driver_sql("""
+            IF OBJECT_ID('dbo.p8_invoice_claims', 'U') IS NOT NULL
+                DROP TABLE dbo.p8_invoice_claims;
+        """)
+
+        p8_hash.to_sql('p8_invoice_hashes', con=conn, if_exists='replace', index=False)
+        p8_claims.to_sql('p8_invoice_claims', con=conn, if_exists='replace', index=False)
+
+        conn.exec_driver_sql(
+            "CREATE INDEX IX_p8_invoice_claims_hash ON dbo.p8_invoice_claims(invoice_hash);"
+        )
+        conn.exec_driver_sql(
+            f"CREATE INDEX IX_p8_invoice_claims_id ON dbo.p8_invoice_claims({col_claim_id});"
+        )
+
+        print("  -> wrote MSSQL tables: p8_invoice_hashes / p8_invoice_claims")
 except Exception as e:
-    print("(warn) write-back skipped:", e)
-
-
-# ================== Intersections (P5–P8) ==================
-# 依赖：claims_min（含 claim_id, vin, servicer/date/contract）、cc（claim→seller 映射，可为空）
-# 以及已算好的 p5_bursts, p6_cross, p7_pairs, p8_hash, p8_claims
-
-# def _to_set(sr):
-#     return set(sr.dropna().astype(str)) if isinstance(sr, pd.Series) else set()
-
-# ---------- 1) P5 ∩ P6：VIN 级 ----------
-# p5_vins = _to_set(p5_bursts['vin']) if not p5_bursts.empty and 'vin' in p5_bursts.columns else set()
-# p6_vins = _to_set(p6_cross['vin'])   if not p6_cross.empty   and 'vin' in p6_cross.columns   else set()
-# vin_p5_p6 = p5_vins & p6_vins
-
-# p5p6_events = pd.DataFrame()
-# if vin_p5_p6:
-#     # 聚合 VIN 的窗口与统计
-#     def _agg_window(df, date_col):
-#         return pd.Series({
-#             'first_date': df[date_col].min(),
-#             'last_date' : df[date_col].max(),
-#             'num_claims': df.shape[0],
-#             'distinct_servicers': df[col_servicer].nunique() if col_servicer in df.columns else np.nan,
-#             'claim_ids': "|".join(df[col_claim_id].astype(str).tolist())
-#         })
-
-#     # 取交集 VIN 的所有理赔
-#     base = claims_min.dropna(subset=['vin']) if 'vin' in claims_min.columns else pd.DataFrame()
-#     if not base.empty:
-#         base = base.assign(**{
-#             col_claim_id: base[col_claim_id].astype(str),
-#             'vin': base['vin'].astype(str)
-#         })
-#         p5p6_events = (base[base['vin'].isin(vin_p5_p6)]
-#                        .groupby('vin', as_index=False)
-#                        .apply(lambda g: _agg_window(g, col_claim_date) if col_claim_date in g.columns else pd.Series({'num_claims':len(g),'claim_ids':"|".join(g[col_claim_id])}))
-#                        .reset_index(drop=True))
-# save_csv(p5p6_events, 'p5p6_vin_intersection.csv')
-
-# # 同时给一张 claim 级明细（便于抽样）
-# p5p6_claims = pd.DataFrame()
-# if vin_p5_p6 and not claims_min.empty and 'vin' in claims_min.columns:
-#     p5p6_claims = (claims_min[claims_min['vin'].astype(str).isin(vin_p5_p6)]
-#                    [[col_claim_id,'vin'] + ([col_claim_date] if col_claim_date in claims_min.columns else []) +
-#                     ([col_servicer] if col_servicer in claims_min.columns else [])])
-#     save_csv(p5p6_claims, 'p5p6_flagged_claims.csv')
-
-# ---------- 2) P7 pairs 与 (P5 或 P6) 的交集 ----------
-# p7_pairs_hits = pd.DataFrame()
-# if ( 'vin' in claims_min.columns and
-#      not claims_min.empty and
-#      not cc.empty and
-#      col_servicer and
-#      'p7_pairs' in globals() and
-#      not p7_pairs.empty ):
-
-#     # 构造 claim → (servicer, seller, vin) 明细
-#     tmp = cc[[col_claim_id, col_cpsi_sel]].dropna().copy()
-#     tmp[col_claim_id] = as_str(tmp[col_claim_id])
-#     tmp[col_cpsi_sel] = as_str(tmp[col_cpsi_sel])
-
-#     attach = claims_min[[col_claim_id, 'vin', col_servicer]].dropna().copy()
-#     attach[col_claim_id] = as_str(attach[col_claim_id])
-#     attach['vin'] = as_str(attach['vin'])
-#     attach[col_servicer] = as_str(attach[col_servicer])
-
-#     tmp = tmp.merge(attach, on=col_claim_id, how='left') \
-#              .dropna(subset=['vin', col_servicer])
-#     tmp = tmp.rename(columns={col_cpsi_sel: 'seller_id',
-#                               col_servicer: 'servicer_id'})
-
-#     # 标记这个 claim 所在 VIN 是否命中 P5 或 P6
-#     p5_or_p6_vins = p5_vins | p6_vins
-#     tmp['in_p5_or_p6_vin'] = tmp['vin'].isin(p5_or_p6_vins)
-
-#     # 只保留已进入 P7 的 pair
-#     key = ['servicer_id', 'seller_id']
-#     pairs = p7_pairs[key].copy()
-#     pairs['servicer_id'] = as_str(pairs['servicer_id'])
-#     pairs['seller_id']   = as_str(pairs['seller_id'])
-
-#     tmp = tmp.merge(pairs, on=key, how='inner')
-
-#     # 统计每个 pair 在 P5/P6 VIN 上的覆盖情况
-#     p7_pairs_hits = (
-#         tmp.groupby(key)
-#            .agg(
-#                distinct_vins_total=('vin', 'nunique'),
-#                distinct_vins_in_p5p6=('in_p5_or_p6_vin', 'sum'),
-#                claims=('vin', 'size')
-#            )
-#            .reset_index()
-#     )
-
-#     # 只保留真的命中 P5/P6 的 pair
-#     p7_pairs_hits = p7_pairs_hits[
-#         p7_pairs_hits['distinct_vins_in_p5p6'] > 0
-#     ].sort_values(
-#         ['distinct_vins_in_p5p6', 'distinct_vins_total', 'claims'],
-#         ascending=False
-#     )
-
-# save_csv(p7_pairs_hits, 'p7_pairs_intersect_p5_or_p6.csv')
- # ---------- 3) P8 与 (P5 或 P6) 的交集（hash & claim 两张） ----------
-# p8_hash_hits = pd.DataFrame()
-# p8_claims_hits = pd.DataFrame()
-# if not p8_claims.empty:
-#     p5_or_p6_vins = p5_vins | p6_vins
-#     # 先确保有 VIN；若 p8_claims 里没有 VIN，就左连 claims_min 拿 VIN
-#     p8c = p8_claims.copy()
-#     if 'vin' not in p8c.columns and 'vin' in claims_min.columns:
-#         p8c = p8c.merge(claims_min[[col_claim_id, 'vin']].astype({col_claim_id:str}), on=col_claim_id, how='left')
-#     if 'vin' in p8c.columns:
-#         p8_claims_hits = p8c[p8c['vin'].astype(str).isin(p5_or_p6_vins)].drop_duplicates()
-#         save_csv(p8_claims_hits, 'p8_claims_intersect_p5_or_p6.csv')
-
-#         # hash 层汇总：命中 p5/p6 的覆盖度
-#         p8_hash_hits = (p8_claims_hits.groupby('invoice_hash')
-#                         .agg(num_claims=('invoice_hash','size'),
-#                              distinct_vins=('vin','nunique'))
-#                         .reset_index()
-#                         .sort_values(['distinct_vins','num_claims'], ascending=False))
-#         save_csv(p8_hash_hits, 'p8_hashes_intersect_p5_or_p6.csv')
-
-# # ---------- 4) 三重交集：P5 ∩ P6 ∩ P8（claim 级） ----------
-# p5p6p8_claims = pd.DataFrame()
-# if not p8_claims.empty and vin_p5_p6:
-#     p8c2 = p8_claims.copy()
-#     if 'vin' not in p8c2.columns and 'vin' in claims_min.columns:
-#         p8c2 = p8c2.merge(claims_min[[col_claim_id, 'vin']].astype({col_claim_id:str}), on=col_claim_id, how='left')
-#     if 'vin' in p8c2.columns:
-#         p5p6p8_claims = p8c2[p8c2['vin'].astype(str).isin(vin_p5_p6)].drop_duplicates()
-#         save_csv(p5p6p8_claims, 'p5p6p8_claims.csv')
-
-# print("[Intersections] Saved:",
-#       "p5p6_vin_intersection.csv,",
-#       "p5p6_flagged_claims.csv,",
-#       "p7_pairs_intersect_p5_or_p6.csv,",
-#       "p8_claims_intersect_p5_or_p6.csv,",
-#       "p8_hashes_intersect_p5_or_p6.csv,",
-#       "p5p6p8_claims.csv")
+    print("(warn) MSSQL write-back for P8 skipped:", e)
 
 # ================= P3∩P4∩P5∩P6∩P7∩P8 (claim-level) =================
-# 依赖：OUT_DIR, col_claim_id, claims_min（含 vin/servicer/日期更好）
-# 尽量复用已在内存里的集合；若没有，则从 out/*.csv 回读做兜底
-
-from pathlib import Path
+# 依赖：OUT_DIR, col_claim_id, claims_min（含 vin/servicer/date 更好）
+# 尽量复用已在内存里的集合；若没有，则从 out/*.csv 回读兜底
 
 def _read_claim_ids_csv(path, col='claim_id', reason_filter=None):
+    """
+    从一个 CSV 文件里读取 claim_id 集合。
+    - col: 哪一列是 claim_id
+    - reason_filter: 如果提供，就只保留 reason 在这个列表里的行
+    """
     p = Path(path)
-    if not p.exists(): return set()
+    if not p.exists():
+        return set()
     try:
         df = pd.read_csv(p, dtype=str, low_memory=False)
         if reason_filter is not None and 'reason' in df.columns:
@@ -553,59 +514,72 @@ def _read_claim_ids_csv(path, col='claim_id', reason_filter=None):
     return set()
 
 # ---------- P3：高频 servicer/seller 的 claim 集 ----------
-# 先用内存变量（若你之前已算过 p3_*_claims），否则从 out 回读
 p3_claims = set()
-if 'p3_servicer_claims' in globals(): p3_claims |= set(map(str, p3_servicer_claims))
-if 'p3_seller_claims'   in globals(): p3_claims |= set(map(str, p3_seller_claims))
+if 'p3_servicer_claims' in globals():
+    p3_claims |= set(map(str, p3_servicer_claims))
+if 'p3_seller_claims' in globals():
+    p3_claims |= set(map(str, p3_seller_claims))
+
 if not p3_claims:
     p3_claims |= _read_claim_ids_csv(OUT_DIR / 'p3_servicer_flagged_claims.csv', col='claim_id')
     p3_claims |= _read_claim_ids_csv(OUT_DIR / 'p3_seller_flagged_claims.csv',   col='claim_id')
 
 # ---------- P4：重复 loss code 的 claim 集 ----------
 p4_claims_set = set()
-# 内存变量优先
 if 'p4_claims' in globals():
     p4_claims_set |= set(map(str, p4_claims))
-# 兜底：从旧口径合并文件里抽 reason = P4
-if not p4_claims_set:
-    p4_claims_set |= _read_claim_ids_csv(OUT_DIR / 'flagged_claims_p1_p4.csv',
-                                         col=str(col_claim_id), reason_filter=['P4_repeat_loss_code'])
-# 兜底2：如果有 p4_suspicious_loss_codes.csv + claim_details 可做回查（此处略）
 
-# ---------- P5 / P6：由 VIN 回查 claim 集 ----------
+if not p4_claims_set:
+    p4_claims_set |= _read_claim_ids_csv(
+        OUT_DIR / 'flagged_claims_p1_p4.csv',
+        col=str(col_claim_id),
+        reason_filter=['P4_repeat_loss_code']
+    )
+
+# ---------- P5 / P6：由 VIN 反查 claim 集 ----------
 def _claims_by_vins(vin_set):
     if vin_set and not claims_min.empty and 'vin' in claims_min.columns:
         vin_set = set(map(str, vin_set))
-        tmp = claims_min[[col_claim_id,'vin']].dropna().copy()
+        tmp = claims_min[[col_claim_id, 'vin']].dropna().copy()
         tmp[col_claim_id] = tmp[col_claim_id].astype(str)
-        tmp['vin'] = tmp['vin'].astype(str)
+        tmp['vin']        = tmp['vin'].astype(str)
         return set(tmp.loc[tmp['vin'].isin(vin_set), col_claim_id])
     return set()
 
-# 若你前面已算过 p5_claims_set/p6_claims_set，就直接用；否则用 p5/p6 的 VIN 反查
 p5_claims_set = globals().get('p5_claims_set', set())
 p6_claims_set = globals().get('p6_claims_set', set())
+
 if not p5_claims_set:
-    p5_vins = set(pd.read_csv(OUT_DIR/'p5_vin_bursts.csv', dtype=str)['vin'].dropna().astype(str)) \
-              if (OUT_DIR/'p5_vin_bursts.csv').exists() else set()
+    p5_vins = set()
+    p5_csv = OUT_DIR / 'p5_vin_bursts.csv'
+    if p5_csv.exists():
+        df_p5 = pd.read_csv(p5_csv, dtype=str, low_memory=False)
+        if 'vin' in df_p5.columns:
+            p5_vins = set(df_p5['vin'].dropna().astype(str))
     p5_claims_set = _claims_by_vins(p5_vins)
+
 if not p6_claims_set:
-    p6_vins = set(pd.read_csv(OUT_DIR/'p6_cross_shop.csv', dtype=str)['vin'].dropna().astype(str)) \
-              if (OUT_DIR/'p6_cross_shop.csv').exists() else set()
+    p6_vins = set()
+    p6_csv = OUT_DIR / 'p6_cross_shop.csv'
+    if p6_csv.exists():
+        df_p6 = pd.read_csv(p6_csv, dtype=str, low_memory=False)
+        if 'vin' in df_p6.columns:
+            p6_vins = set(df_p6['vin'].dropna().astype(str))
     p6_claims_set = _claims_by_vins(p6_vins)
 
 # ---------- P7：高密度 pair 覆盖的 claim 集 ----------
 p7_pair_claims_set = globals().get('p7_pair_claims_set', set())
 
-
 # ---------- P8：克隆发票的 claim 集 ----------
 p8_claims_set = set()
 if 'p8_claims' in globals() and not p8_claims.empty and col_claim_id in p8_claims.columns:
     p8_claims_set = set(p8_claims[col_claim_id].dropna().astype(str))
-elif (OUT_DIR/'p8_invoice_flagged_claims.csv').exists():
-    p8_claims_set = _read_claim_ids_csv(OUT_DIR/'p8_invoice_flagged_claims.csv', col='claim_id')
+else:
+    p8_csv = OUT_DIR / 'p8_invoice_flagged_claims.csv'
+    if p8_csv.exists():
+        p8_claims_set = _read_claim_ids_csv(p8_csv, col='claim_id')
 
-# ---------- 六重交集 ----------
+# ---------- 六重交集（P3∩P4∩P5∩P6∩P7∩P8） ----------
 claims_p3to8 = sorted(list(
     (p3_claims or set()) &
     (p4_claims_set or set()) &
@@ -615,9 +589,12 @@ claims_p3to8 = sorted(list(
     (p8_claims_set or set())
 ))
 
-# 保存成 CSV（附带常用维度）
+print(f"[P3–P8 six-way intersection] |intersection| = {len(claims_p3to8)}")
+
+# ---------- 生成明细表 p3p4p5p6p7p8_claims ----------
 p3to8_df = pd.DataFrame({col_claim_id: claims_p3to8})
 
+# 挂上 vin / servicer / 日期
 if not claims_min.empty:
     keep = [col_claim_id]
     if 'vin' in claims_min.columns:
@@ -627,25 +604,21 @@ if not claims_min.empty:
     if col_claim_date in claims_min.columns:
         keep.append(col_claim_date)
 
-    p3to8_df = p3to8_df.merge(
-        claims_min[keep].drop_duplicates(subset=[col_claim_id]),
-        on=col_claim_id,
-        how='left'
-    )
+    base = claims_min[keep].drop_duplicates(subset=[col_claim_id]).copy()
+    base[col_claim_id] = base[col_claim_id].astype(str).str.strip()
+    p3to8_df[col_claim_id] = p3to8_df[col_claim_id].astype(str).str.strip()
 
-# ===== 把 seller 标到结果表上 =====
-# cc 里已经有 claim_id -> seller_id 的映射（col_cpsi_sel）
+    p3to8_df = p3to8_df.merge(base, on=col_claim_id, how='left')
+
+# ---------- 把 seller_id / seller_name 挂上 ----------
 if 'cc' in globals() and not cc.empty and (col_claim_id in cc.columns):
     try:
-        # 只取 claim_id 和 seller 列
         seller_map = cc[[col_claim_id, col_cpsi_sel]].dropna().copy()
         seller_map[col_claim_id] = as_str(seller_map[col_claim_id])
         seller_map[col_cpsi_sel] = as_str(seller_map[col_cpsi_sel])
 
-        # 一个 claim 只留一个 seller（去重）
         seller_map = seller_map.drop_duplicates(subset=[col_claim_id])
 
-        # merge 到 p3to8_df
         p3to8_df[col_claim_id] = as_str(p3to8_df[col_claim_id])
         p3to8_df = p3to8_df.merge(
             seller_map.rename(columns={col_cpsi_sel: 'seller_id'}),
@@ -653,17 +626,24 @@ if 'cc' in globals() and not cc.empty and (col_claim_id in cc.columns):
             how='left'
         )
 
-        # （可选）再从 entity_sellers 表里把 seller 名字带上
         if not seller.empty:
-            col_seller_id_main = pick_col(seller,
-                                          ['iid', 'iId', 'seller_id', 'id'],
-                                          tag='seller.id')
-            col_seller_name = pick_col(seller,
-                                       ['sname', 'seller_name', 'name'],
-                                       required=False,
-                                       tag='seller.name')
-            if col_seller_name:
-                s_info = seller[[col_seller_id_main, col_seller_name]].dropna().copy()
+            col_seller_id_main = pick_col(
+                seller,
+                ['iid', 'iId', 'seller_id', 'id'],
+                tag='seller.id'
+            )
+            col_seller_name = pick_col(
+                seller,
+                ['sname', 'seller_name', 'name', 'legal_name', 'display_name'],
+                required=False,
+                tag='seller.name'
+            )
+            if col_seller_id_main:
+                s_info_cols = [col_seller_id_main]
+                if col_seller_name:
+                    s_info_cols.append(col_seller_name)
+
+                s_info = seller[s_info_cols].dropna().copy()
                 s_info[col_seller_id_main] = as_str(s_info[col_seller_id_main])
 
                 p3to8_df['seller_id'] = as_str(p3to8_df['seller_id'])
@@ -673,14 +653,33 @@ if 'cc' in globals() and not cc.empty and (col_claim_id in cc.columns):
                     right_on=col_seller_id_main,
                     how='left'
                 )
-                # 统一列名：seller_name
-                p3to8_df = p3to8_df.rename(columns={col_seller_name: 'seller_name'})
-                # 把内部使用的 seller 主键列删掉，避免重复
+
+                if col_seller_name:
+                    p3to8_df = p3to8_df.rename(columns={col_seller_name: 'seller_name'})
+
                 p3to8_df.drop(columns=[col_seller_id_main], inplace=True, errors='ignore')
 
     except Exception as e:
         print("(warn) attach seller to p3p4p5p6p7p8_claims failed:", e)
 
-# 最后再保存
-save_csv(p3to8_df, 'p3p4p5p6p7p8_claims.csv')
-print(f"[P3–P8 six-way intersection] claims = {len(p3to8_df)}  -> p3p4p5p6p7p8_claims.csv")
+# ---------- 保存到 CSV ----------
+csv_path = save_csv(p3to8_df, 'p3p4p5p6p7p8_claims.csv')
+
+# ---------- 同步写回 MSSQL ----------
+try:
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            IF OBJECT_ID('dbo.p3p4p5p6p7p8_claims', 'U') IS NOT NULL
+                DROP TABLE dbo.p3p4p5p6p7p8_claims;
+        """)
+        p3to8_df.to_sql('p3p4p5p6p7p8_claims', con=conn, if_exists='replace', index=False)
+
+        conn.exec_driver_sql(
+            f"CREATE INDEX IX_p3p4p5p6p7p8_claims_{col_claim_id} "
+            f"ON dbo.p3p4p5p6p7p8_claims({col_claim_id});"
+        )
+        print("  -> wrote MSSQL table: p3p4p5p6p7p8_claims")
+except Exception as e:
+    print("(warn) MSSQL write-back for p3p4p5p6p7p8_claims failed:", e)
+
+print(f"[P3–P8 six-way intersection] final rows = {len(p3to8_df)}  -> {csv_path.name}")
